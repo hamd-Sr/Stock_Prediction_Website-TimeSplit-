@@ -36,7 +36,6 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
     f1_score,
-    precision_recall_curve,
     recall_score,
     roc_auc_score,
 )
@@ -49,9 +48,9 @@ warnings.filterwarnings("ignore")
 
 try:
     from lightgbm import LGBMClassifier  # type: ignore
-
     HAS_LIGHTGBM = True
 except Exception:
+    LGBMClassifier = None  # type: ignore
     HAS_LIGHTGBM = False
 
 
@@ -119,7 +118,6 @@ def standardize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = out.rename(columns=rename_map)
     out.columns = [str(c).replace(" ", "_") for c in out.columns]
 
-    # Fallback: if first five columns resemble OHLCV but names are odd, map positionally.
     required = ["Open", "High", "Low", "Close", "Volume"]
     missing = [c for c in required if c not in out.columns]
     if missing and len(out.columns) >= 5:
@@ -201,7 +199,6 @@ def build_features(raw: pd.DataFrame, horizon_bars: int, move_threshold: float) 
     open_ = df["Open"]
     volume = df["Volume"]
 
-    # Returns and momentum
     df["ret_1"] = close.pct_change()
     df["ret_2"] = close.pct_change(2)
     df["ret_3"] = close.pct_change(3)
@@ -211,14 +208,12 @@ def build_features(raw: pd.DataFrame, horizon_bars: int, move_threshold: float) 
     df["momentum_5"] = close - close.shift(5)
     df["momentum_10"] = close - close.shift(10)
 
-    # Trend
     for w in (5, 10, 20, 50):
         df[f"sma_{w}"] = close.rolling(w).mean()
         df[f"ema_{w}"] = close.ewm(span=w, adjust=False).mean()
         df[f"dist_sma_{w}"] = close / df[f"sma_{w}"] - 1.0
         df[f"volatility_{w}"] = df["ret_1"].rolling(w).std()
 
-    # Momentum indicators
     df["rsi_14"] = rsi(close, 14)
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
@@ -226,7 +221,6 @@ def build_features(raw: pd.DataFrame, horizon_bars: int, move_threshold: float) 
     df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
     df["macd_hist"] = df["macd"] - df["macd_signal"]
 
-    # Volatility / range
     df["atr_14"] = atr(high, low, close, 14)
     df["hl_range"] = (high - low) / close
     df["oc_range"] = (open_ - close) / close
@@ -239,7 +233,6 @@ def build_features(raw: pd.DataFrame, horizon_bars: int, move_threshold: float) 
     df["bb_width"] = ((bb_mid + 2 * bb_std) - (bb_mid - 2 * bb_std)) / bb_mid
     df["bb_z"] = (close - bb_mid) / bb_std
 
-    # Volume
     df["vol_chg"] = volume.pct_change()
     df["vol_sma_20"] = volume.rolling(20).mean()
     df["vol_z"] = (volume - df["vol_sma_20"]) / volume.rolling(20).std()
@@ -250,7 +243,6 @@ def build_features(raw: pd.DataFrame, horizon_bars: int, move_threshold: float) 
     df["close_vwap"] = close / vwap - 1.0
     df["vwap_z"] = (close - vwap) / close
 
-    # Session / clock features
     df["dow"] = idx.dayofweek
     df["hour"] = idx.hour
     df["minute"] = idx.minute
@@ -260,7 +252,6 @@ def build_features(raw: pd.DataFrame, horizon_bars: int, move_threshold: float) 
     df["sin_minute"] = np.sin(2 * np.pi * df["minute"] / 60)
     df["cos_minute"] = np.cos(2 * np.pi * df["minute"] / 60)
 
-    # Target: a meaningful next move, not tiny noise
     df["future_return"] = close.shift(-horizon_bars) / close - 1.0
     df["target"] = (df["future_return"] > move_threshold).astype(int)
 
@@ -299,7 +290,7 @@ def make_sample_weights(y: pd.Series) -> np.ndarray:
 def build_candidate_models(scale_pos_weight: float) -> Dict[str, object]:
     models: Dict[str, object] = {}
 
-    if HAS_LIGHTGBM:
+    if HAS_LIGHTGBM and LGBMClassifier is not None:
         models["LightGBM"] = LGBMClassifier(
             n_estimators=600,
             learning_rate=0.03,
@@ -336,7 +327,7 @@ def build_candidate_models(scale_pos_weight: float) -> Dict[str, object]:
 
 
 def fit_model_with_weights(model, X, y, sample_weight: np.ndarray):
-    if isinstance(model, LGBMClassifier):
+    if HAS_LIGHTGBM and LGBMClassifier is not None and isinstance(model, LGBMClassifier):
         model.fit(X, y, sample_weight=sample_weight)
         return model
 
@@ -345,7 +336,6 @@ def fit_model_with_weights(model, X, y, sample_weight: np.ndarray):
         return model
 
     if hasattr(model, "steps"):
-        # Pipeline path: last step name is typically logisticregression
         last_step = model.steps[-1][0]
         fit_kwargs = {f"{last_step}__sample_weight": sample_weight}
         model.fit(X, y, **fit_kwargs)
@@ -515,7 +505,11 @@ def metric_cards_for_strategy(sf: pd.DataFrame) -> Dict[str, float]:
     win_rate = float((active["strategy_return"] > 0).mean()) if not active.empty else np.nan
     total_return = float((1 + sf["strategy_return"]).prod() - 1)
     buy_hold_return = float((1 + sf["buy_hold"]).prod() - 1)
-    sharpe_like = float(sf["strategy_return"].mean() / sf["strategy_return"].std(ddof=0)) if sf["strategy_return"].std(ddof=0) > 0 else np.nan
+    sharpe_like = (
+        float(sf["strategy_return"].mean() / sf["strategy_return"].std(ddof=0))
+        if sf["strategy_return"].std(ddof=0) > 0
+        else np.nan
+    )
 
     return {
         "total_return": total_return,
@@ -560,7 +554,6 @@ if raw.empty:
 if len(raw) < 200:
     st.warning("Very small dataset returned. Metrics may be unstable.")
 
-# Build features
 move_threshold = move_threshold_pct / 100.0
 feature_df, feature_cols = build_features(raw, horizon_bars=horizon_bars, move_threshold=move_threshold)
 
@@ -589,7 +582,6 @@ X_test = X.iloc[val_end:]
 y_test = y.iloc[val_end:]
 fr_test = future_returns.iloc[val_end:]
 
-# Candidate ranking
 pos = max(int(y_train.sum()), 1)
 neg = max(len(y_train) - pos, 1)
 scale_pos_weight = neg / pos
@@ -620,10 +612,8 @@ leaderboard = leaderboard.sort_values(
 best_name = leaderboard.iloc[0]["model"]
 best_estimator = leaderboard.iloc[0]["estimator"]
 
-# Fit calibrated model on training set
 trained_model = try_calibrated_fit(best_estimator, X_train, y_train)
 
-# Validation probabilities and threshold tuning based on PnL
 val_proba = predict_proba_positive(trained_model, X_val)
 threshold_grid = threshold_search(
     fr_val,
@@ -637,12 +627,10 @@ if threshold_grid.empty:
 else:
     best_threshold = float(threshold_grid.iloc[0]["threshold"])
 
-# Validation PR-AUC / recall for class 1 at the chosen threshold
 val_pr_auc = average_precision_score(y_val, val_proba) if len(np.unique(y_val)) > 1 else np.nan
 val_pred_binary = (val_proba >= best_threshold).astype(int)
 val_recall_pos = recall_score(y_val, val_pred_binary, pos_label=1, zero_division=0)
 
-# Test evaluation
 test_proba = predict_proba_positive(trained_model, X_test)
 test_pred = positions_from_probability(test_proba, best_threshold)
 test_pred_binary = (test_pred == 1).astype(int)
@@ -657,7 +645,6 @@ test_auc = safe_auc(y_test, test_proba)
 test_pr_auc = average_precision_score(y_test, test_proba) if len(np.unique(y_test)) > 1 else np.nan
 test_recall_pos = recall_score(y_test, test_pred_binary, pos_label=1, zero_division=0)
 
-# Final live model on all labeled data
 final_model = try_calibrated_fit(best_estimator, X, y)
 latest_X = X.iloc[[-1]]
 latest_prob = float(predict_proba_positive(final_model, latest_X)[0])
@@ -668,6 +655,7 @@ elif latest_prob <= 1 - best_threshold:
     live_signal = "SELL"
 else:
     live_signal = "HOLD"
+
 
 # -----------------------------
 # Dashboard
