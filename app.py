@@ -2,11 +2,12 @@
 
 What this app does:
 - Downloads intraday or daily OHLCV data from Yahoo Finance via yfinance
-- Builds technical + session-based features
-- Trains candidate models on time-ordered data
-- Uses TimeSeriesSplit for model selection
+- Builds technical, volume, volatility, and session-based features
+- Handles class imbalance
+- Uses time-ordered validation so future data is not mixed into training
+- Compares candidate models using PR-AUC and recall for class 1
 - Calibrates probabilities when possible
-- Tunes the trading threshold on validation data
+- Tunes the trading threshold on validation PnL
 - Evaluates on a held-out test slice
 - Refits a final live model on all labeled data for the latest signal
 
@@ -30,15 +31,19 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     balanced_accuracy_score,
     classification_report,
     confusion_matrix,
     f1_score,
+    precision_recall_curve,
+    recall_score,
     roc_auc_score,
 )
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.utils.class_weight import compute_sample_weight
 
 warnings.filterwarnings("ignore")
 
@@ -54,7 +59,7 @@ except Exception:
 # Streamlit config
 # -----------------------------
 st.set_page_config(
-    page_title="Advanced Intraday Signal Dashboard",
+    page_title="Advanced Intraday Stock Signal Dashboard",
     page_icon="📈",
     layout="wide",
 )
@@ -114,7 +119,7 @@ def standardize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = out.rename(columns=rename_map)
     out.columns = [str(c).replace(" ", "_") for c in out.columns]
 
-    # Fallback: if the first five columns look like OHLCV but names are odd, map positionally.
+    # Fallback: if first five columns resemble OHLCV but names are odd, map positionally.
     required = ["Open", "High", "Low", "Close", "Volume"]
     missing = [c for c in required if c not in out.columns]
     if missing and len(out.columns) >= 5:
@@ -255,7 +260,7 @@ def build_features(raw: pd.DataFrame, horizon_bars: int, move_threshold: float) 
     df["sin_minute"] = np.sin(2 * np.pi * df["minute"] / 60)
     df["cos_minute"] = np.cos(2 * np.pi * df["minute"] / 60)
 
-    # Target
+    # Target: a meaningful next move, not tiny noise
     df["future_return"] = close.shift(-horizon_bars) / close - 1.0
     df["target"] = (df["future_return"] > move_threshold).astype(int)
 
@@ -287,7 +292,11 @@ def tscv_for_samples(n_samples: int) -> TimeSeriesSplit:
     return TimeSeriesSplit(n_splits=n_splits)
 
 
-def build_candidate_models() -> Dict[str, object]:
+def make_sample_weights(y: pd.Series) -> np.ndarray:
+    return compute_sample_weight(class_weight="balanced", y=y)
+
+
+def build_candidate_models(scale_pos_weight: float) -> Dict[str, object]:
     models: Dict[str, object] = {}
 
     if HAS_LIGHTGBM:
@@ -298,10 +307,10 @@ def build_candidate_models() -> Dict[str, object]:
             max_depth=-1,
             subsample=0.85,
             colsample_bytree=0.85,
-            reg_alpha=0.0,
             reg_lambda=1.0,
             random_state=42,
             n_jobs=-1,
+            scale_pos_weight=scale_pos_weight,
         )
 
     models["HistGradientBoosting"] = HistGradientBoostingClassifier(
@@ -326,6 +335,29 @@ def build_candidate_models() -> Dict[str, object]:
     return models
 
 
+def fit_model_with_weights(model, X, y, sample_weight: np.ndarray):
+    if isinstance(model, LGBMClassifier):
+        model.fit(X, y, sample_weight=sample_weight)
+        return model
+
+    if isinstance(model, HistGradientBoostingClassifier):
+        model.fit(X, y, sample_weight=sample_weight)
+        return model
+
+    if hasattr(model, "steps"):
+        # Pipeline path: last step name is typically logisticregression
+        last_step = model.steps[-1][0]
+        fit_kwargs = {f"{last_step}__sample_weight": sample_weight}
+        model.fit(X, y, **fit_kwargs)
+        return model
+
+    try:
+        model.fit(X, y, sample_weight=sample_weight)
+    except TypeError:
+        model.fit(X, y)
+    return model
+
+
 def safe_auc(y_true: pd.Series, proba: np.ndarray) -> float:
     if len(np.unique(y_true)) < 2:
         return np.nan
@@ -337,39 +369,46 @@ class CandidateScore:
     name: str
     cv_accuracy: float
     cv_f1: float
+    cv_recall_pos: float
+    cv_pr_auc: float
     cv_balanced_accuracy: float
-    cv_auc: float
     estimator: object
+
+
+def predict_proba_positive(model: object, X: pd.DataFrame) -> np.ndarray:
+    if hasattr(model, "predict_proba"):
+        return model.predict_proba(X)[:, 1]
+    return np.full(len(X), 0.5)
 
 
 def score_model_timeseries(name: str, estimator: object, X_train: pd.DataFrame, y_train: pd.Series) -> CandidateScore:
     cv = tscv_for_samples(len(X_train))
-    accs, f1s, bals, aucs = [], [], [], []
+    accs, f1s, recalls, bals, aps = [], [], [], [], []
 
     for train_idx, valid_idx in cv.split(X_train):
         X_tr, X_va = X_train.iloc[train_idx], X_train.iloc[valid_idx]
         y_tr, y_va = y_train.iloc[train_idx], y_train.iloc[valid_idx]
 
+        sample_weight = make_sample_weights(y_tr)
         model = clone(estimator)
-        model.fit(X_tr, y_tr)
+        model = fit_model_with_weights(model, X_tr, y_tr, sample_weight)
 
         pred = model.predict(X_va)
-        if hasattr(model, "predict_proba"):
-            proba = model.predict_proba(X_va)[:, 1]
-        else:
-            proba = np.full(len(X_va), 0.5)
+        proba = predict_proba_positive(model, X_va)
 
         accs.append(accuracy_score(y_va, pred))
         f1s.append(f1_score(y_va, pred, zero_division=0))
+        recalls.append(recall_score(y_va, pred, pos_label=1, zero_division=0))
         bals.append(balanced_accuracy_score(y_va, pred))
-        aucs.append(safe_auc(y_va, proba))
+        aps.append(average_precision_score(y_va, proba))
 
     return CandidateScore(
         name=name,
         cv_accuracy=float(np.nanmean(accs)),
         cv_f1=float(np.nanmean(f1s)),
+        cv_recall_pos=float(np.nanmean(recalls)),
+        cv_pr_auc=float(np.nanmean(aps)),
         cv_balanced_accuracy=float(np.nanmean(bals)),
-        cv_auc=float(np.nanmean(aucs)),
         estimator=estimator,
     )
 
@@ -386,14 +425,12 @@ def try_calibrated_fit(estimator: object, X: pd.DataFrame, y: pd.Series) -> obje
         return calibrated
     except Exception:
         fallback = clone(estimator)
-        fallback.fit(X, y)
+        sample_weight = make_sample_weights(y)
+        try:
+            fallback = fit_model_with_weights(fallback, X, y, sample_weight)
+        except Exception:
+            fallback.fit(X, y)
         return fallback
-
-
-def predict_proba_positive(model: object, X: pd.DataFrame) -> np.ndarray:
-    if hasattr(model, "predict_proba"):
-        return model.predict_proba(X)[:, 1]
-    return np.full(len(X), 0.5)
 
 
 def positions_from_probability(proba: np.ndarray, threshold: float) -> np.ndarray:
@@ -431,8 +468,9 @@ def threshold_search(
     y_future_return: pd.Series,
     proba: np.ndarray,
     transaction_cost_bps: float,
+    y_true: pd.Series | None = None,
     start: float = 0.50,
-    stop: float = 0.80,
+    stop: float = 0.90,
     step: float = 0.01,
 ) -> pd.DataFrame:
     rows = []
@@ -442,23 +480,33 @@ def threshold_search(
         sf = strategy_frame(y_future_return, proba, t, transaction_cost_bps)
         if sf.empty:
             continue
+
         net = sf["strategy_return"]
         mean = float(net.mean())
         std = float(net.std(ddof=0))
         sharpe_like = mean / std if std > 0 else -np.inf
-        rows.append(
-            {
-                "threshold": t,
-                "total_net_return": float((1 + net).prod() - 1),
-                "mean_return": mean,
-                "sharpe_like": sharpe_like,
-                "trade_count": int((sf["position"] != 0).sum()),
-            }
-        )
+
+        row = {
+            "threshold": t,
+            "total_net_return": float((1 + net).prod() - 1),
+            "mean_return": mean,
+            "sharpe_like": sharpe_like,
+            "trade_count": int((sf["position"] != 0).sum()),
+        }
+
+        if y_true is not None:
+            pred_bin = (proba >= t).astype(int)
+            row["recall_pos"] = recall_score(y_true, pred_bin, pos_label=1, zero_division=0)
+            row["pr_auc"] = average_precision_score(y_true, proba)
+
+        rows.append(row)
 
     out = pd.DataFrame(rows)
     if not out.empty:
-        out = out.sort_values(["total_net_return", "sharpe_like"], ascending=False).reset_index(drop=True)
+        sort_cols = ["total_net_return", "sharpe_like"]
+        if "recall_pos" in out.columns:
+            sort_cols = ["total_net_return", "recall_pos", "sharpe_like"]
+        out = out.sort_values(sort_cols, ascending=False).reset_index(drop=True)
     return out
 
 
@@ -489,7 +537,7 @@ with st.sidebar:
     period = st.selectbox("History window", ["30d", "60d", "3mo", "6mo"], index=1)
     interval = st.selectbox("Candles", ["5m", "15m", "30m", "60m", "1d"], index=0)
     horizon_bars = st.selectbox("Prediction horizon (bars)", [1, 2, 3, 5], index=1)
-    move_threshold_pct = st.slider("Future move threshold (%)", 0.00, 1.00, 0.15, 0.05)
+    move_threshold_pct = st.slider("Future move threshold (%)", 0.10, 1.50, 0.25, 0.05)
     transaction_cost_bps = st.slider("Transaction cost (bps)", 0.0, 20.0, 5.0, 0.5)
     refresh = st.button("Refresh data")
 
@@ -512,7 +560,7 @@ if raw.empty:
 if len(raw) < 200:
     st.warning("Very small dataset returned. Metrics may be unstable.")
 
-# Prepare data
+# Build features
 move_threshold = move_threshold_pct / 100.0
 feature_df, feature_cols = build_features(raw, horizon_bars=horizon_bars, move_threshold=move_threshold)
 
@@ -542,8 +590,13 @@ y_test = y.iloc[val_end:]
 fr_test = future_returns.iloc[val_end:]
 
 # Candidate ranking
-candidates = build_candidate_models()
+pos = max(int(y_train.sum()), 1)
+neg = max(len(y_train) - pos, 1)
+scale_pos_weight = neg / pos
+
+candidates = build_candidate_models(scale_pos_weight=scale_pos_weight)
 leaderboard_rows = []
+
 for name, estimator in candidates.items():
     score = score_model_timeseries(name, estimator, X_train, y_train)
     leaderboard_rows.append(
@@ -551,30 +604,45 @@ for name, estimator in candidates.items():
             "model": score.name,
             "cv_accuracy": score.cv_accuracy,
             "cv_f1": score.cv_f1,
+            "cv_recall_pos": score.cv_recall_pos,
+            "cv_pr_auc": score.cv_pr_auc,
             "cv_balanced_accuracy": score.cv_balanced_accuracy,
-            "cv_auc": score.cv_auc,
             "estimator": score.estimator,
         }
     )
 
 leaderboard = pd.DataFrame(leaderboard_rows)
-leaderboard = leaderboard.sort_values(["cv_f1", "cv_auc", "cv_accuracy"], ascending=False).reset_index(drop=True)
+leaderboard = leaderboard.sort_values(
+    ["cv_pr_auc", "cv_recall_pos", "cv_balanced_accuracy"],
+    ascending=False,
+).reset_index(drop=True)
 
 best_name = leaderboard.iloc[0]["model"]
 best_estimator = leaderboard.iloc[0]["estimator"]
 
-# Fit calibrated model on training set only
+# Fit calibrated model on training set
 trained_model = try_calibrated_fit(best_estimator, X_train, y_train)
 
-# Tune threshold on validation set to maximize net return
+# Validation probabilities and threshold tuning based on PnL
 val_proba = predict_proba_positive(trained_model, X_val)
-threshold_grid = threshold_search(fr_val, val_proba, transaction_cost_bps)
+threshold_grid = threshold_search(
+    fr_val,
+    val_proba,
+    transaction_cost_bps,
+    y_true=y_val,
+)
+
 if threshold_grid.empty:
     best_threshold = 0.55
 else:
     best_threshold = float(threshold_grid.iloc[0]["threshold"])
 
-# Evaluate on test
+# Validation PR-AUC / recall for class 1 at the chosen threshold
+val_pr_auc = average_precision_score(y_val, val_proba) if len(np.unique(y_val)) > 1 else np.nan
+val_pred_binary = (val_proba >= best_threshold).astype(int)
+val_recall_pos = recall_score(y_val, val_pred_binary, pos_label=1, zero_division=0)
+
+# Test evaluation
 test_proba = predict_proba_positive(trained_model, X_test)
 test_pred = positions_from_probability(test_proba, best_threshold)
 test_pred_binary = (test_pred == 1).astype(int)
@@ -582,13 +650,14 @@ test_pred_binary = (test_pred == 1).astype(int)
 test_sf = strategy_frame(fr_test, test_proba, best_threshold, transaction_cost_bps)
 test_metrics = metric_cards_for_strategy(test_sf) if not test_sf.empty else {}
 
-# Standard classification metrics
 test_accuracy = accuracy_score(y_test, test_pred_binary)
 test_f1 = f1_score(y_test, test_pred_binary, zero_division=0)
 test_bal_acc = balanced_accuracy_score(y_test, test_pred_binary)
 test_auc = safe_auc(y_test, test_proba)
+test_pr_auc = average_precision_score(y_test, test_proba) if len(np.unique(y_test)) > 1 else np.nan
+test_recall_pos = recall_score(y_test, test_pred_binary, pos_label=1, zero_division=0)
 
-# Refit final live model on all labeled data for the latest signal
+# Final live model on all labeled data
 final_model = try_calibrated_fit(best_estimator, X, y)
 latest_X = X.iloc[[-1]]
 latest_prob = float(predict_proba_positive(final_model, latest_X)[0])
@@ -641,15 +710,20 @@ c4.metric("Selected model", best_name)
 c5, c6, c7, c8 = st.columns(4)
 c5.metric("Chosen threshold", f"{best_threshold:.2f}")
 c6.metric("Test accuracy", f"{test_accuracy:.2%}")
-c7.metric("Test F1", f"{test_f1:.2%}")
-c8.metric("Test AUC", "N/A" if np.isnan(test_auc) else f"{test_auc:.2%}")
+c7.metric("Test PR-AUC", "N/A" if np.isnan(test_pr_auc) else f"{test_pr_auc:.2%}")
+c8.metric("Test recall (class 1)", f"{test_recall_pos:.2%}")
+
+c9, c10, c11, c12 = st.columns(4)
+c9.metric("Validation PR-AUC", "N/A" if np.isnan(val_pr_auc) else f"{val_pr_auc:.2%}")
+c10.metric("Validation recall (class 1)", f"{val_recall_pos:.2%}")
+c11.metric("Test F1", f"{test_f1:.2%}")
+c12.metric("Test AUC", "N/A" if np.isnan(test_auc) else f"{test_auc:.2%}")
 
 st.markdown("### Candidate leaderboard")
 leaderboard_view = leaderboard.copy()
-leaderboard_view["cv_accuracy"] = leaderboard_view["cv_accuracy"].round(4)
-leaderboard_view["cv_f1"] = leaderboard_view["cv_f1"].round(4)
-leaderboard_view["cv_balanced_accuracy"] = leaderboard_view["cv_balanced_accuracy"].round(4)
-leaderboard_view["cv_auc"] = leaderboard_view["cv_auc"].round(4)
+for col in ["cv_accuracy", "cv_f1", "cv_recall_pos", "cv_pr_auc", "cv_balanced_accuracy"]:
+    leaderboard_view[col] = leaderboard_view[col].round(4)
+
 st.dataframe(
     leaderboard_view.drop(columns=["estimator"]),
     use_container_width=True,
