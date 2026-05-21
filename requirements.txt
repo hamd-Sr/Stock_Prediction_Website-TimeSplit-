@@ -1,9 +1,10 @@
 streamlit
+streamlit-autorefresh
 yfinance
 pandas
 numpy
 scikit-learn
 plotly
-
-# Optional: uncomment in a compatible environment to enable the preferred boosting model
+kiteconnect
+# optional:
 # lightgbm
