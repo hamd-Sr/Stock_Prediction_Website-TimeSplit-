@@ -2,16 +2,16 @@
 
 What this app does:
 - Downloads intraday or daily OHLCV data from Yahoo Finance via yfinance
-- Builds technical, volume, volatility, and session-based features
+- Builds technical, volume, volatility, session, and regime features
 - Handles class imbalance
 - Uses time-ordered validation so future data is not mixed into training
 - Compares candidate models using PR-AUC and recall for class 1
 - Calibrates probabilities when possible
-- Tunes the trading threshold on validation PnL
+- Tunes the trading threshold on validation PnL with a recall-aware score
 - Evaluates on a held-out test slice
 - Refits a final live model on all labeled data for the latest signal
 
-Educational use only. Not financial advice.
+Educational use only. Not financial advice. For live order placement, connect a broker API separately.
 """
 
 from __future__ import annotations
@@ -189,6 +189,20 @@ def intraday_vwap(frame: pd.DataFrame) -> pd.Series:
     return cum_pv / cum_vol
 
 
+def regime_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    close = out["Close"]
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    out["ema20"] = ema20
+    out["ema50"] = ema50
+    out["trend_spread"] = ema20 / ema50 - 1.0
+    out["trend_slope_20"] = ema20.pct_change(3)
+    out["trend_slope_50"] = ema50.pct_change(5)
+    out["regime_trend"] = ((out["trend_spread"] > 0) & (out["trend_slope_20"] > 0)).astype(int)
+    return out
+
+
 def build_features(raw: pd.DataFrame, horizon_bars: int, move_threshold: float) -> Tuple[pd.DataFrame, List[str]]:
     df = ensure_price_frame(raw).copy()
     idx = pd.DatetimeIndex(df.index)
@@ -243,6 +257,8 @@ def build_features(raw: pd.DataFrame, horizon_bars: int, move_threshold: float) 
     df["close_vwap"] = close / vwap - 1.0
     df["vwap_z"] = (close - vwap) / close
 
+    df = regime_features(df)
+
     df["dow"] = idx.dayofweek
     df["hour"] = idx.hour
     df["minute"] = idx.minute
@@ -292,8 +308,8 @@ def build_candidate_models(scale_pos_weight: float) -> Dict[str, object]:
 
     if HAS_LIGHTGBM and LGBMClassifier is not None:
         models["LightGBM"] = LGBMClassifier(
-            n_estimators=600,
-            learning_rate=0.03,
+            n_estimators=900,
+            learning_rate=0.02,
             num_leaves=31,
             max_depth=-1,
             subsample=0.85,
@@ -306,8 +322,8 @@ def build_candidate_models(scale_pos_weight: float) -> Dict[str, object]:
 
     models["HistGradientBoosting"] = HistGradientBoostingClassifier(
         loss="log_loss",
-        learning_rate=0.04,
-        max_iter=350,
+        learning_rate=0.03,
+        max_iter=450,
         max_depth=4,
         min_samples_leaf=20,
         l2_regularization=0.1,
@@ -317,7 +333,7 @@ def build_candidate_models(scale_pos_weight: float) -> Dict[str, object]:
     models["LogisticRegression"] = make_pipeline(
         StandardScaler(),
         LogisticRegression(
-            max_iter=4000,
+            max_iter=5000,
             class_weight="balanced",
             solver="lbfgs",
         ),
@@ -460,7 +476,7 @@ def threshold_search(
     transaction_cost_bps: float,
     y_true: pd.Series | None = None,
     start: float = 0.50,
-    stop: float = 0.90,
+    stop: float = 0.65,
     step: float = 0.01,
 ) -> pd.DataFrame:
     rows = []
@@ -492,11 +508,14 @@ def threshold_search(
         rows.append(row)
 
     out = pd.DataFrame(rows)
-    if not out.empty:
-        sort_cols = ["total_net_return", "sharpe_like"]
-        if "recall_pos" in out.columns:
-            sort_cols = ["total_net_return", "recall_pos", "sharpe_like"]
-        out = out.sort_values(sort_cols, ascending=False).reset_index(drop=True)
+    if out.empty:
+        return out
+
+    out["combined_score"] = (
+        out["total_net_return"] * 0.60
+        + out.get("recall_pos", pd.Series(0.0, index=out.index)) * 0.40
+    )
+    out = out.sort_values(["combined_score", "sharpe_like"], ascending=False).reset_index(drop=True)
     return out
 
 
@@ -521,6 +540,20 @@ def metric_cards_for_strategy(sf: pd.DataFrame) -> Dict[str, float]:
     }
 
 
+def market_open_now_ist() -> bool:
+    try:
+        from datetime import datetime
+        import pytz
+
+        india = pytz.timezone("Asia/Kolkata")
+        now = datetime.now(india)
+        market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        return market_open <= now <= market_close
+    except Exception:
+        return True
+
+
 # -----------------------------
 # Sidebar
 # -----------------------------
@@ -529,9 +562,9 @@ with st.sidebar:
     market = st.selectbox("Market", ["NSE", "BSE"], index=0)
     ticker_input = st.text_input("Ticker", value="RELIANCE")
     period = st.selectbox("History window", ["30d", "60d", "3mo", "6mo"], index=1)
-    interval = st.selectbox("Candles", ["5m", "15m", "30m", "60m", "1d"], index=0)
-    horizon_bars = st.selectbox("Prediction horizon (bars)", [1, 2, 3, 5], index=1)
-    move_threshold_pct = st.slider("Future move threshold (%)", 0.10, 1.50, 0.25, 0.05)
+    interval = st.selectbox("Candles", ["15m", "5m", "30m", "60m", "1d"], index=0)
+    horizon_bars = st.selectbox("Prediction horizon (bars)", [1, 2, 3, 5], index=2)
+    move_threshold_pct = st.slider("Future move threshold (%)", 0.10, 1.50, 0.35, 0.05)
     transaction_cost_bps = st.slider("Transaction cost (bps)", 0.0, 20.0, 5.0, 0.5)
     refresh = st.button("Refresh data")
 
@@ -545,6 +578,9 @@ if refresh:
     st.cache_data.clear()
 
 st.subheader(f"Live view for {symbol}")
+
+if not market_open_now_ist():
+    st.warning("Indian stock market is currently closed. Intraday candles may be stale or delayed.")
 
 raw = load_data(symbol, period, interval)
 if raw.empty:
@@ -620,6 +656,9 @@ threshold_grid = threshold_search(
     val_proba,
     transaction_cost_bps,
     y_true=y_val,
+    start=0.50,
+    stop=0.65,
+    step=0.01,
 )
 
 if threshold_grid.empty:
@@ -630,6 +669,11 @@ else:
 val_pr_auc = average_precision_score(y_val, val_proba) if len(np.unique(y_val)) > 1 else np.nan
 val_pred_binary = (val_proba >= best_threshold).astype(int)
 val_recall_pos = recall_score(y_val, val_pred_binary, pos_label=1, zero_division=0)
+
+# Use a softer, PnL-aware signal gate when the model is conservative.
+if val_recall_pos == 0 and best_threshold > 0.60:
+    best_threshold = 0.60
+
 
 test_proba = predict_proba_positive(trained_model, X_test)
 test_pred = positions_from_probability(test_proba, best_threshold)
@@ -645,6 +689,7 @@ test_auc = safe_auc(y_test, test_proba)
 test_pr_auc = average_precision_score(y_test, test_proba) if len(np.unique(y_test)) > 1 else np.nan
 test_recall_pos = recall_score(y_test, test_pred_binary, pos_label=1, zero_division=0)
 
+# Final live model on all labeled data
 final_model = try_calibrated_fit(best_estimator, X, y)
 latest_X = X.iloc[[-1]]
 latest_prob = float(predict_proba_positive(final_model, latest_X)[0])
@@ -655,6 +700,10 @@ elif latest_prob <= 1 - best_threshold:
     live_signal = "SELL"
 else:
     live_signal = "HOLD"
+
+# regime filter for display only
+latest_regime_trend = int(feature_df["regime_trend"].iloc[-1])
+regime_text = "Trend regime" if latest_regime_trend == 1 else "Non-trend regime"
 
 
 # -----------------------------
@@ -706,6 +755,9 @@ c9.metric("Validation PR-AUC", "N/A" if np.isnan(val_pr_auc) else f"{val_pr_auc:
 c10.metric("Validation recall (class 1)", f"{val_recall_pos:.2%}")
 c11.metric("Test F1", f"{test_f1:.2%}")
 c12.metric("Test AUC", "N/A" if np.isnan(test_auc) else f"{test_auc:.2%}")
+
+st.markdown("### Current regime")
+st.write(regime_text)
 
 st.markdown("### Candidate leaderboard")
 leaderboard_view = leaderboard.copy()
